@@ -68,11 +68,38 @@ function dbGet(date){return new Promise(function(resolve,reject){var r=state.db.
 function dbPut(day,date){return new Promise(function(resolve,reject){var r=state.db.transaction(STORE,'readwrite').objectStore(STORE).put({date:key(date),tasks:day.tasks,rolledOver:!!day.rolledOver});r.onsuccess=function(){resolve()};r.onerror=function(){reject(r.error)}})}
 function dbAll(){return new Promise(function(resolve,reject){var r=state.db.transaction(STORE,'readonly').objectStore(STORE).getAll();r.onsuccess=function(){resolve(r.result||[])};r.onerror=function(){reject(r.error)}})}
 function migrateLocalStorage(){return new Promise(function(resolve){try{var tx=state.db.transaction(STORE,'readwrite'),store=tx.objectStore(STORE),found=0;for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);if(k&&k.indexOf('worktasks:')===0&&k!=='worktasks:meta'){var raw=localStorage.getItem(k);try{var d=JSON.parse(raw);var date=k.replace('worktasks:','');if(d&&Array.isArray(d.tasks)){store.put({date:date,tasks:d.tasks,rolledOver:!!d.rolledOver});found++}}catch(e){}}}tx.oncomplete=function(){resolve(found)}}catch(e){resolve(0)}})}
+async function rolloverPastDays(){
+  var todayKey=key(nowIST());
+  var setting=await new Promise(function(resolve,reject){var r=state.db.transaction(SETTINGS,'readonly').objectStore(SETTINGS).get('lastRollover');r.onsuccess=function(){resolve(r.result?r.result.value:null)};r.onerror=function(){reject(r.error)}});
+  if(!setting){
+    try{var legacy=localStorage.getItem('worktasks:meta');if(legacy){var m=JSON.parse(legacy);if(m&&m.lastRollover)setting=m.lastRollover}}catch(e){}
+    if(!setting){
+      await new Promise(function(resolve,reject){var r=state.db.transaction(SETTINGS,'readwrite').objectStore(SETTINGS).put({key:'lastRollover',value:todayKey});r.onsuccess=resolve;r.onerror=reject});
+      return;
+    }
+  }
+  var cursorKey=setting;
+  while(cursorKey<todayKey){
+    var cursorDate=parseKey(cursorKey),nextDate=addDays(cursorDate,1),nextKey=key(nextDate);
+    var dayData=await dbGet(cursorDate);
+    var undone=dayData.tasks.filter(function(t){return !t.done;});
+    if(undone.length){
+      dayData.tasks=dayData.tasks.filter(function(t){return t.done;});
+      dayData.rolledOver=true;
+      await dbPut(dayData,cursorDate);
+      var nextData=await dbGet(nextDate);
+      undone.forEach(function(t){t.carriedFrom=t.carriedFrom||cursorKey;nextData.tasks.push(t)});
+      await dbPut(nextData,nextDate);
+    }
+    cursorKey=nextKey;
+  }
+  await new Promise(function(resolve,reject){var r=state.db.transaction(SETTINGS,'readwrite').objectStore(SETTINGS).put({key:'lastRollover',value:todayKey});r.onsuccess=resolve;r.onerror=reject});
+}
 function setStatus(t){document.getElementById('saveStatus').textContent=t;document.getElementById('dbStatus').textContent=t}
 async function save(){try{await dbPut(state.day,state.date);setStatus('Saved to IndexedDB');renderAll()}catch(e){setStatus('Save failed')}}
 async function loadDay(){state.day=await dbGet(state.date)}
 async function loadWeek(){var arr=[];for(var i=6;i>=0;i--){var d=addDays(nowIST(),-i),day=await dbGet(d);arr.push({date:d,data:day})}state.week=arr}
-async function init(){try{await openDB();var count=await dbAll();if(!count.length){var migrated=await migrateLocalStorage();if(migrated)count=await dbAll()}setStatus('Database ready');state.date=nowIST();state.monthCursor=new Date(state.date);await loadDay();await loadWeek();renderAll()}catch(e){setStatus('IndexedDB unavailable')}}
+async function init(){try{await openDB();var count=await dbAll();if(!count.length){var migrated=await migrateLocalStorage();if(migrated)count=await dbAll()}await rolloverPastDays();setStatus('Database ready');state.date=nowIST();state.monthCursor=new Date(state.date);await loadDay();await loadWeek();renderAll()}catch(e){console.error(e);setStatus('IndexedDB unavailable')}}
 function tasks(){return state.day.tasks.filter(function(t){return state.filter==='all'||(state.filter==='active'&&!t.done)||(state.filter==='completed'&&t.done)})}
 function statCards(){var done=state.day.tasks.filter(t=>t.done).length,total=state.day.tasks.length,pct=completion(state.day),pending=total-done,high=state.day.tasks.filter(t=>!t.done&&t.priority==='high').length;var bars=state.week.map(function(w){var h=Math.max(4,completion(w.data));return '<div class="bar '+(key(w.date)===key(nowIST())?'today':'')+'" style="height:'+h+'%" title="'+h+'%"></div>'}).join('');return '<div class="stats"><div class="stat"><div class="stat-label">Completion</div><div class="stat-value">'+(total?pct+'%':'—')+'</div><div class="stat-sub">'+done+' of '+total+' done</div></div><div class="stat"><div class="stat-label">Pending</div><div class="stat-value" style="color:var(--pink)">'+pending+'</div><div class="stat-sub">'+high+' high priority open</div></div><div class="stat"><div class="stat-label">Streak</div><div class="stat-value" style="color:var(--orange)">'+streak()+'</div><div class="stat-sub">days fully cleared</div></div><div class="stat"><div class="stat-label">Last 7 Days</div><div class="bar-chart">'+bars+'</div></div></div>'}
 function streak(){var s=0;for(var i=state.week.length-1;i>=0;i--){var d=state.week[i].data;if(d.tasks.length&&d.tasks.every(t=>t.done)&&!d.rolledOver)s++;else break}return s}
